@@ -119,7 +119,9 @@ def _validate(data: dict, known_ids: set[str]) -> None:
             raise SegmentSelectionError(f"unknown key_point_id: {kp}")
 
 
-def _snap_value(value: float, silence: list[float]) -> float:
+def snap_to_silence(value: float, silence: list[float]) -> float:
+    """Snap a timestamp to the nearest silence boundary (FR-15). Used by selection
+    and by reviewer boundary nudges (B6)."""
     return min(silence, key=lambda s: abs(s - value)) if silence else value
 
 
@@ -129,8 +131,8 @@ def _snap_and_total(data: dict, transcript: dict, target_max: int) -> dict:
     silence = sorted(set(transcript.get("silence_points", [])))
     snapped, total = [], 0.0
     for seg in data["segments"]:
-        s = round(_snap_value(seg["start_sec"], silence), 3)
-        e = round(_snap_value(seg["end_sec"], silence), 3)
+        s = round(snap_to_silence(seg["start_sec"], silence), 3)
+        e = round(snap_to_silence(seg["end_sec"], silence), 3)
         if e <= s:
             continue  # boundary collapsed onto one point — drop it
         seg = {**seg, "start_sec": s, "end_sec": e,

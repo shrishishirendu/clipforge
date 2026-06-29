@@ -68,3 +68,19 @@ pending back-fill into requirements v0.2:
 - Status: `/start` sets the headline to `TRANSCRIBING` for the whole parallel phase;
   `/status` derives per-stage states (transcription/extraction/selection/review/render)
   from persisted artifacts (FR-24).
+
+## B6 — Clip-list review API (FR-16, FR-17, FR-18)
+- **Coverage is recomputed from the live segments** on every read/edit (covered =
+  key_point_ids referenced by segments; uncovered = the rest). The LLM's
+  uncovered list is not trusted as durable state — avoids drift as the user edits.
+- `PATCH /cliplist` applies a batch of edits: remove, reorder (`order`, then
+  contiguously renumbered), lock/unlock, and boundary nudge. **Nudged boundaries
+  snap to the nearest silence point (FR-15)**; an edit that collapses a segment
+  (end ≤ start) is rejected 422. Edits are blocked once the list is APPROVED (409).
+- `POST /reedit` is **async** (matches the job model): it re-opens the job
+  (status → SELECTING) and enqueues `reedit_stage`; the client polls /status or
+  re-fetches /cliplist. `run_reedit` keeps locked segments exactly and asks the LLM
+  to re-select only the key points not covered by locked segments, within the
+  remaining time budget; new segments overlapping a locked range are dropped.
+- `rebuild_clip_list` is the single writer for clip lists (selection, re-edit),
+  recomputing coverage/total and preserving each segment's `locked` flag.

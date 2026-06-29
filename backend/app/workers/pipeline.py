@@ -180,7 +180,7 @@ def run_selection(db: Session, llm: LLMProvider, project_id: str) -> Project:
              "silence_points": transcript.silence_points,
              "full_text": transcript.full_text},
             project.target_min_sec, project.target_max_sec, llm=llm)
-        _persist_clip_list(db, project_id, result)
+        rebuild_clip_list(db, project_id, result["segments"], key_points)
         project.status = JobStatus.AWAITING_REVIEW  # the approval gate (FR-19)
         db.commit()
     except Exception:
@@ -189,24 +189,94 @@ def run_selection(db: Session, llm: LLMProvider, project_id: str) -> Project:
     return project
 
 
-def _persist_clip_list(db: Session, project_id: str, result: dict) -> None:
+def rebuild_clip_list(db: Session, project_id: str, segments: list[dict],
+                      key_points: list) -> ClipList:
+    """Replace the clip list with `segments`, recomputing total + coverage from the
+    segments themselves (coverage = key points referenced; uncovered = the rest).
+    Preserves each segment's `locked` flag. Used by selection, re-edit, and PATCH."""
     existing = db.query(ClipList).filter_by(project_id=project_id).one_or_none()
     if existing is not None:
         db.delete(existing)  # cascades to segments
         db.flush()
-    clip = ClipList(project_id=project_id,
-                    total_duration_sec=int(round(result.get("total_duration_sec", 0))),
+    covered = {s.get("key_point_id") for s in segments if s.get("key_point_id")}
+    uncovered = [kp.id for kp in key_points if kp.id not in covered]
+    total = sum(s["end_sec"] - s["start_sec"] for s in segments)
+    clip = ClipList(project_id=project_id, total_duration_sec=int(round(total)),
                     approval_status=ApprovalStatus.PENDING,
-                    uncovered_key_point_ids=result.get("uncovered_key_point_ids", []))
+                    uncovered_key_point_ids=uncovered)
     db.add(clip)
     db.flush()
-    for i, seg in enumerate(result["segments"]):
-        db.add(Segment(clip_list_id=clip.id, order=i,
-                       start_sec=float(seg["start_sec"]), end_sec=float(seg["end_sec"]),
-                       transcript_snippet=seg.get("transcript", ""),
-                       confidence=float(seg.get("confidence", 0.0)),
-                       key_point_id=seg.get("key_point_id"), locked=False))
+    for i, s in enumerate(segments):
+        db.add(Segment(
+            clip_list_id=clip.id, order=i,
+            start_sec=float(s["start_sec"]), end_sec=float(s["end_sec"]),
+            transcript_snippet=s.get("transcript", s.get("transcript_snippet", "")),
+            confidence=float(s.get("confidence", 0.0)),
+            key_point_id=s.get("key_point_id"), locked=bool(s.get("locked", False))))
     db.flush()
+    return clip
+
+
+# === Re-edit, preserving locked segments (FR-17, design back-fill) ==========
+
+def reedit_stage(project_id: str) -> None:
+    db = SessionLocal()
+    try:
+        run_reedit(db, get_llm_provider(), project_id)
+    finally:
+        db.close()
+
+
+def _overlaps_any(start: float, end: float, locked: list) -> bool:
+    return any(not (end <= L.start_sec or start >= L.end_sec) for L in locked)
+
+
+def run_reedit(db: Session, llm: LLMProvider, project_id: str) -> Project:
+    """Re-run selection while keeping locked segments exactly. The LLM only
+    re-selects the key points not already covered by locked segments, within the
+    remaining time budget; new segments overlapping a locked range are dropped."""
+    project = db.get(Project, project_id)
+    if project is None:
+        raise ValueError(f"project {project_id} not found")
+    clip = db.query(ClipList).filter_by(project_id=project_id).one_or_none()
+    transcript = db.query(Transcript).filter_by(project_id=project_id).one_or_none()
+    key_points = db.query(KeyPoint).filter_by(project_id=project_id).all()
+    if clip is None or transcript is None or not key_points:
+        raise ValueError("re-edit requires an existing clip list, transcript, key points")
+
+    locked = [s for s in clip.segments if s.locked]
+    project.status = JobStatus.SELECTING
+    db.commit()
+    try:
+        locked_kp_ids = {s.key_point_id for s in locked if s.key_point_id}
+        locked_duration = sum(s.end_sec - s.start_sec for s in locked)
+        remaining_kps = [kp for kp in key_points if kp.id not in locked_kp_ids]
+        budget_max = max(0, project.target_max_sec - int(round(locked_duration)))
+
+        proposal = []
+        if remaining_kps and budget_max > 0:
+            result = select_segments(
+                [{"id": kp.id, "text": kp.text, "source": kp.source} for kp in remaining_kps],
+                {"word_timings": transcript.word_timings,
+                 "silence_points": transcript.silence_points,
+                 "full_text": transcript.full_text},
+                min(project.target_min_sec, budget_max), budget_max, llm=llm)
+            proposal = [s for s in result["segments"]
+                        if not _overlaps_any(s["start_sec"], s["end_sec"], locked)]
+
+        merged = [{"start_sec": s.start_sec, "end_sec": s.end_sec,
+                   "transcript": s.transcript_snippet, "key_point_id": s.key_point_id,
+                   "confidence": s.confidence, "locked": True} for s in locked]
+        merged += [{**s, "locked": False} for s in proposal]
+        merged.sort(key=lambda x: x["start_sec"])
+
+        rebuild_clip_list(db, project_id, merged, key_points)
+        project.status = JobStatus.AWAITING_REVIEW  # re-opened for review (FR-19)
+        db.commit()
+    except Exception:
+        _mark_failed(db, project_id)
+        raise
+    return project
 
 
 # === Render (B7) ============================================================

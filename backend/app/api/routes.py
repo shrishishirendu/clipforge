@@ -8,16 +8,17 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.models.entities import (
-    AssetStatus, AssetType, ClipList, JobStatus, KeyPoint, MediaAsset, Project,
-    Transcript,
+    ApprovalStatus, AssetStatus, AssetType, ClipList, JobStatus, KeyPoint,
+    MediaAsset, Project, Transcript,
 )
 from app.schemas.api import (
     AssetOut, AssetUploadRequest, AssetUploadResponse,
-    ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, StatusOut,
+    ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, SegmentOut, StatusOut,
 )
 from app.services.interfaces import ObjectStorage
+from app.services.segment_selection import snap_to_silence
 from app.services.storage import get_storage
-from app.workers.pipeline import extract_stage, transcribe_stage
+from app.workers.pipeline import extract_stage, reedit_stage, transcribe_stage
 from app.workers.queue import get_queue
 
 router = APIRouter()
@@ -204,23 +205,97 @@ def get_status(project_id: str, db: Session = Depends(get_db)):
                                           has_key_points, has_clip_list))
 
 
+def _require_clip(db: Session, project_id: str):
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    clip = db.query(ClipList).filter_by(project_id=project_id).one_or_none()
+    if clip is None:
+        raise HTTPException(404, "no clip list yet — selection has not completed")
+    return project, clip
+
+
+def _clip_list_out(clip: ClipList, key_points: list[KeyPoint]) -> ClipListOut:
+    """Shape the response, recomputing coverage + total from the live segments."""
+    segs = sorted(clip.segments, key=lambda s: s.order)
+    covered = {s.key_point_id for s in segs if s.key_point_id}
+    uncovered = [kp.id for kp in key_points if kp.id not in covered]
+    total = int(round(sum(s.end_sec - s.start_sec for s in segs)))
+    return ClipListOut(
+        id=clip.id, total_duration_sec=total,
+        approval_status=clip.approval_status.value,
+        uncovered_key_point_ids=uncovered,
+        segments=[SegmentOut(id=s.id, order=s.order, start_sec=s.start_sec,
+                             end_sec=s.end_sec, transcript_snippet=s.transcript_snippet,
+                             confidence=s.confidence, key_point_id=s.key_point_id,
+                             locked=s.locked) for s in segs])
+
+
 @router.get("/projects/{project_id}/cliplist", response_model=ClipListOut)
-def get_cliplist(project_id: str):
+def get_cliplist(project_id: str, db: Session = Depends(get_db)):
     """The proposed clip list for review (FR-16)."""
-    raise HTTPException(501, "not implemented — task B6")
+    _, clip = _require_clip(db, project_id)
+    key_points = db.query(KeyPoint).filter_by(project_id=project_id).all()
+    return _clip_list_out(clip, key_points)
 
 
 @router.patch("/projects/{project_id}/cliplist", response_model=ClipListOut)
-def patch_cliplist(project_id: str, body: ClipListPatch):
-    """Apply reorder / remove / nudge / lock edits (FR-17). Recomputes
-    coverage and total duration."""
-    raise HTTPException(501, "not implemented — task B6")
+def patch_cliplist(project_id: str, body: ClipListPatch, db: Session = Depends(get_db)):
+    """Apply reorder / remove / nudge / lock edits (FR-17, FR-18). Boundary nudges
+    snap to silence (FR-15); coverage + total are recomputed."""
+    _, clip = _require_clip(db, project_id)
+    if clip.approval_status == ApprovalStatus.APPROVED:
+        raise HTTPException(409, "clip list already approved; cannot edit")
+
+    segs = {s.id: s for s in clip.segments}
+    transcript = db.query(Transcript).filter_by(project_id=project_id).one_or_none()
+    silence = sorted(set(transcript.silence_points)) if transcript else []
+
+    for edit in body.edits:
+        seg = segs.get(edit.segment_id)
+        if seg is None:
+            raise HTTPException(404, f"segment {edit.segment_id} not found in this clip list")
+        if edit.remove:
+            db.delete(seg)
+            segs.pop(edit.segment_id)
+            continue
+        if edit.order is not None:
+            seg.order = edit.order
+        if edit.locked is not None:
+            seg.locked = edit.locked
+        if edit.start_sec is not None:
+            seg.start_sec = round(snap_to_silence(edit.start_sec, silence), 3)
+        if edit.end_sec is not None:
+            seg.end_sec = round(snap_to_silence(edit.end_sec, silence), 3)
+        if seg.end_sec <= seg.start_sec:
+            raise HTTPException(422, f"segment {seg.id} has non-positive duration after nudge")
+
+    db.flush()
+    # renumber order contiguously (reorder edits may leave gaps/dupes)
+    for i, seg in enumerate(sorted(segs.values(), key=lambda s: (s.order, s.start_sec))):
+        seg.order = i
+
+    key_points = db.query(KeyPoint).filter_by(project_id=project_id).all()
+    covered = {s.key_point_id for s in segs.values() if s.key_point_id}
+    clip.uncovered_key_point_ids = [kp.id for kp in key_points if kp.id not in covered]
+    clip.total_duration_sec = int(round(sum(s.end_sec - s.start_sec for s in segs.values())))
+    db.commit()
+    db.refresh(clip)
+    return _clip_list_out(clip, key_points)
 
 
-@router.post("/projects/{project_id}/reedit")
-def reedit(project_id: str):
-    """Re-run selection, preserving locked segments (design back-fill)."""
-    raise HTTPException(501, "not implemented — task B6")
+@router.post("/projects/{project_id}/reedit", status_code=202)
+def reedit(project_id: str, db: Session = Depends(get_db),
+           queue: Queue = Depends(get_queue)):
+    """Re-run selection, preserving locked segments (FR-17, design back-fill).
+    Async: re-opens the job and enqueues the re-edit; poll /status or /cliplist."""
+    project, clip = _require_clip(db, project_id)
+    if clip.approval_status == ApprovalStatus.APPROVED:
+        raise HTTPException(409, "clip list already approved; cannot re-edit")
+    project.status = JobStatus.SELECTING
+    db.commit()
+    queue.enqueue(reedit_stage, project_id)
+    return {"project_id": project_id, "status": project.status.value}
 
 
 @router.post("/projects/{project_id}/approve")
