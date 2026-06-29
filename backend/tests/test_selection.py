@@ -89,6 +89,16 @@ def test_strips_code_fences():
     assert out["segments"][0]["start_sec"] == 0.0
 
 
+def test_coerces_string_typed_numbers():
+    # LLMs sometimes emit numeric fields as strings — accept and coerce them.
+    resp = _resp([{"start_sec": "0.0", "end_sec": "4.0", "transcript": "x",
+                   "key_point_id": "kp-1", "confidence": "0.8"}], "4.0")
+    out = select_segments(KEY_POINTS, TRANSCRIPT, 2, 10, llm=FakeLLM([resp]))
+    seg = out["segments"][0]
+    assert seg["start_sec"] == 0.0 and seg["end_sec"] == 4.0
+    assert seg["confidence"] == 0.8
+
+
 def test_clamps_confidence():
     resp = _resp([{"start_sec": 0.0, "end_sec": 4.0, "transcript": "x",
                    "key_point_id": "kp-1", "confidence": 5.0}], 4.0)

@@ -25,6 +25,7 @@ boundaries. Select segments that:
 - begin and end ONLY on the provided silence boundaries,
 - read as coherent standalone clips.
 For each segment set key_point_id to the id of the key point it covers.
+start_sec, end_sec and confidence must be NUMBERS (not strings).
 Return ONLY valid JSON, no prose, no markdown fences, shaped exactly as:
 {"segments":[{"start_sec":N,"end_sec":N,"transcript":"...","key_point_id":"kp-id","confidence":0.0}],
  "total_duration_sec":N,"uncovered_key_point_ids":["kp-id"]}"""
@@ -111,9 +112,15 @@ def _validate(data: dict, known_ids: set[str]) -> None:
     if not isinstance(data.get("segments"), list):
         raise SegmentSelectionError("missing or non-list 'segments'")
     for seg in data["segments"]:
-        s, e = seg.get("start_sec"), seg.get("end_sec")
-        if not isinstance(s, (int, float)) or not isinstance(e, (int, float)) or e <= s:
+        # LLMs sometimes emit numbers as strings ("278.91") — coerce, don't reject.
+        try:
+            s = float(seg["start_sec"])
+            e = float(seg["end_sec"])
+        except (KeyError, TypeError, ValueError):
             raise SegmentSelectionError(f"bad segment bounds: {seg}")
+        if e <= s:
+            raise SegmentSelectionError(f"bad segment bounds: {seg}")
+        seg["start_sec"], seg["end_sec"] = s, e  # normalise to float for downstream
         kp = seg.get("key_point_id")
         if kp is not None and kp not in known_ids:
             raise SegmentSelectionError(f"unknown key_point_id: {kp}")
