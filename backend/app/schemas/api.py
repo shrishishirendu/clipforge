@@ -17,6 +17,32 @@ class ProjectOut(BaseModel):
     status: str
 
 
+class AssetUploadRequest(BaseModel):
+    """Request a presigned upload slot for one asset (FR-01..03)."""
+    type: str            # "video" | "deck" | "summary"
+    filename: str        # original name; the extension determines `format`
+
+
+class AssetUploadResponse(BaseModel):
+    """The presigned PUT target — client uploads the file directly to storage."""
+    asset_id: str
+    type: str
+    storage_uri: str     # object key in the media bucket
+    upload_url: str      # presigned PUT URL (arch §7: bypasses the app tier)
+    expires_in: int
+
+
+class AssetOut(BaseModel):
+    """A registered asset and its upload state."""
+    id: str
+    project_id: str
+    type: str
+    status: str          # "pending" | "ready"
+    format: str
+    size_bytes: int
+    storage_uri: str
+
+
 class SegmentOut(BaseModel):
     id: str
     order: int

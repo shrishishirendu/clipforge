@@ -37,6 +37,11 @@ class AssetType(str, enum.Enum):
     SUMMARY = "summary"
 
 
+class AssetStatus(str, enum.Enum):
+    PENDING = "pending"   # presigned URL issued, awaiting client upload (B2)
+    READY = "ready"       # upload confirmed via head_object (asset-complete callback)
+
+
 class ApprovalStatus(str, enum.Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -65,9 +70,10 @@ class MediaAsset(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"))
     type: Mapped[AssetType] = mapped_column(Enum(AssetType))
-    storage_uri: Mapped[str] = mapped_column(String)
+    storage_uri: Mapped[str] = mapped_column(String)  # object key in the media bucket
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
-    format: Mapped[str] = mapped_column(String, default="")
+    format: Mapped[str] = mapped_column(String, default="")  # file extension, e.g. "mp4"
+    status: Mapped[AssetStatus] = mapped_column(Enum(AssetStatus), default=AssetStatus.PENDING)
     project: Mapped[Project] = relationship(back_populates="assets")
 
 

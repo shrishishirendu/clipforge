@@ -11,6 +11,7 @@ def test_health():
     assert r.json()["status"] == "ok"
 
 
-def test_create_project_stub_returns_501():
-    r = client.post("/api/projects", json={"title": "Test"})
-    assert r.status_code == 501  # stub until task B2
+def test_start_stub_still_501_until_b4():
+    """Sanity: endpoints not yet built remain explicit 501 stubs."""
+    r = client.post("/api/projects/any-id/start")
+    assert r.status_code == 501
