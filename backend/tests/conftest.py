@@ -1,8 +1,10 @@
 """Test fixtures. Endpoint tests run against an in-memory SQLite DB and a fake
 object store, so the suite is hermetic — no Postgres or MinIO required, keeping
 `pytest` green anywhere (working agreement)."""
+import fakeredis
 import pytest
 from fastapi.testclient import TestClient
+from rq import Queue
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -11,6 +13,7 @@ from app.core.db import get_db
 from app.main import app
 from app.models import Base
 from app.services.storage import get_storage
+from app.workers.queue import QUEUE_NAME, get_queue
 
 
 class FakeStorage:
@@ -27,6 +30,13 @@ class FakeStorage:
         if key in self.objects:
             return {"size_bytes": self.objects[key]}
         return None
+
+    def download_to_path(self, key: str, dest_path: str) -> None:
+        if key not in self.objects:
+            raise FileNotFoundError(key)
+        # content is irrelevant — the fake transcription provider ignores the file
+        with open(dest_path, "wb") as fh:
+            fh.write(b"fake-media-bytes")
 
     # --- test helper, not part of the ObjectStorage interface ---
     def simulate_upload(self, key: str, size_bytes: int = 1024):
@@ -52,7 +62,14 @@ def storage():
 
 
 @pytest.fixture
-def client(db_engine, storage):
+def queue():
+    """A fakeredis-backed async queue: enqueue() records jobs without running them,
+    so tests can assert what was enqueued without a worker or live Redis."""
+    return Queue(QUEUE_NAME, connection=fakeredis.FakeStrictRedis())
+
+
+@pytest.fixture
+def client(db_engine, storage, queue):
     TestingSession = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
 
     def override_get_db():
@@ -64,6 +81,7 @@ def client(db_engine, storage):
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_storage] = lambda: storage
+    app.dependency_overrides[get_queue] = lambda: queue
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()

@@ -3,16 +3,21 @@ NotImplementedError; Claude Code fills these in per BUILD_PLAN.md."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from rq import Queue
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.models.entities import AssetStatus, AssetType, MediaAsset, Project
+from app.models.entities import (
+    AssetStatus, AssetType, JobStatus, MediaAsset, Project, Transcript,
+)
 from app.schemas.api import (
     AssetOut, AssetUploadRequest, AssetUploadResponse,
     ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, StatusOut,
 )
 from app.services.interfaces import ObjectStorage
 from app.services.storage import get_storage
+from app.workers.pipeline import transcribe_stage
+from app.workers.queue import get_queue
 
 router = APIRouter()
 
@@ -123,17 +128,64 @@ def complete_asset(project_id: str, asset_id: str,
     return _asset_out(asset)
 
 
-@router.post("/projects/{project_id}/start")
-def start_processing(project_id: str):
-    """Begin processing once all three assets present (FR-04). Enqueues
-    transcription + extraction."""
-    raise HTTPException(501, "not implemented — task B4")
+REQUIRED_ASSET_TYPES = {AssetType.VIDEO, AssetType.DECK, AssetType.SUMMARY}
+
+# Stages surfaced to the processing screen (FR-24). B4 implements transcription;
+# later tasks fill in the rest. Listed so the frontend stepper (F2) has the shape.
+PIPELINE_STAGES = ["transcription", "extraction", "selection", "review", "render"]
+_STAGE_PCT = {"done": 100, "running": 50, "pending": 0, "failed": 0}
+
+
+def _build_stages(status: JobStatus, has_transcript: bool) -> list[dict]:
+    if has_transcript:
+        transcription = "done"
+    elif status == JobStatus.TRANSCRIBING:
+        transcription = "running"
+    elif status == JobStatus.FAILED:
+        transcription = "failed"
+    else:
+        transcription = "pending"
+    states = {"transcription": transcription}  # remaining stages: B5+
+    return [
+        {"name": s, "state": states.get(s, "pending"),
+         "pct": _STAGE_PCT[states.get(s, "pending")]}
+        for s in PIPELINE_STAGES
+    ]
+
+
+@router.post("/projects/{project_id}/start", status_code=202)
+def start_processing(project_id: str, db: Session = Depends(get_db),
+                     queue: Queue = Depends(get_queue)):
+    """Begin processing once all three assets are present and READY (FR-04).
+    Enqueues transcription (B4); extraction joins it in B5."""
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+
+    ready = {a.type for a in project.assets if a.status == AssetStatus.READY}
+    missing = REQUIRED_ASSET_TYPES - ready
+    if missing:
+        raise HTTPException(
+            409, "missing READY assets: " + ", ".join(sorted(m.value for m in missing)))
+    if project.status not in (JobStatus.CREATED, JobStatus.FAILED):
+        raise HTTPException(409, f"already started (status: {project.status.value})")
+
+    project.status = JobStatus.TRANSCRIBING
+    db.commit()
+    queue.enqueue(transcribe_stage, project_id)
+    return {"project_id": project_id, "status": project.status.value}
 
 
 @router.get("/projects/{project_id}/status", response_model=StatusOut)
-def get_status(project_id: str):
+def get_status(project_id: str, db: Session = Depends(get_db)):
     """Current stage & per-stage progress (FR-24)."""
-    raise HTTPException(501, "not implemented — task B4")
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    has_transcript = (
+        db.query(Transcript).filter_by(project_id=project_id).first() is not None)
+    return StatusOut(project_id=project_id, status=project.status.value,
+                     stages=_build_stages(project.status, has_transcript))
 
 
 @router.get("/projects/{project_id}/cliplist", response_model=ClipListOut)

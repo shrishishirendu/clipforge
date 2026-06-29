@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     segment_selection_model: str = "claude-sonnet-4-6"  # Sonnet is sufficient (NFR-02)
     transcription_provider: str = "whisper_local"  # or "deepgram", "assemblyai" (OQ-02)
 
+    # Local Whisper (faster-whisper). Model size trades speed for accuracy; int8 is
+    # the CPU-friendly default. Override via env for GPU/larger models.
+    whisper_model: str = "base"
+    whisper_compute_type: str = "int8"
+    # Minimum inter-word gap (sec) counted as a silence/sentence boundary for clean
+    # cut points (FR-09, FR-15).
+    silence_gap_sec: float = 0.4
+
     # Pipeline constraints
     default_target_min_sec: int = 180  # 3 min
     default_target_max_sec: int = 240  # 4 min

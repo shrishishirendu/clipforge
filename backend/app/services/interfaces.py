@@ -18,6 +18,10 @@ class ObjectStorage(Protocol):
         asset-complete callback to confirm the upload landed)."""
         ...
 
+    def download_to_path(self, key: str, dest_path: str) -> None:
+        """Download the object to a local path (workers pull media to process it)."""
+        ...
+
 
 class TranscriptionProvider(Protocol):
     def transcribe(self, audio_uri: str, vocabulary: list[str]) -> dict:

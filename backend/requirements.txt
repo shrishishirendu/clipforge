@@ -8,6 +8,8 @@ psycopg[binary]==3.2.3
 redis==5.1.1
 rq==2.0.0
 anthropic==0.39.0
+faster-whisper==1.0.3  # local transcription (decodes via PyAV; no system FFmpeg)
+requests==2.34.2       # faster-whisper model downloads (transitive, pinned explicitly)
 python-multipart==0.0.12
 boto3==1.35.36
 python-pptx==1.0.2

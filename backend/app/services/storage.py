@@ -46,6 +46,9 @@ class S3Storage:
             raise
         return {"size_bytes": head["ContentLength"]}
 
+    def download_to_path(self, key: str, dest_path: str) -> None:
+        self._client.download_file(self._bucket, key, dest_path)
+
 
 @lru_cache
 def get_storage() -> S3Storage:
