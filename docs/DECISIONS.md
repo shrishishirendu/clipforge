@@ -46,3 +46,25 @@ pending back-fill into requirements v0.2:
 - Env note: on Windows+Anaconda a global `sitecustomize.py` patches `shutil.move`
   into a 2-arg form that breaks huggingface_hub model downloads. `app/core/winshim.py`
   re-wraps it (no-op on stock/Linux shutil) so faster-whisper can cache models.
+
+## B5 — Extraction + segment selection (core IP) (FR-10..15, FR-19)
+- The raw model call is behind `LLMProvider` (Claude Sonnet, NFR-02); the prompt,
+  strict-JSON validation, and snapping stay in `services/segment_selection.py` (the IP).
+- Internal contract uses numeric `start_sec`/`end_sec` (matching Segment + transcript),
+  not the `HH:MM:SS` shown illustratively in arch §9.
+- Transcript is sent to the LLM as compact **lines** (word timings grouped at silence
+  boundaries) + the silence-point list, not raw word timings (token cost).
+- **Snap-to-silence (FR-15)** is enforced server-side: each boundary snaps to the
+  nearest silence point; a segment that collapses to zero length is dropped.
+- Over-target is **flagged** (`_over_target`), never silently truncated (FR-14).
+- Key points: deck → one per slide/page; summary → one per line/paragraph (bullet
+  markers stripped). Behind the `DocumentParser` interface (python-pptx/docx/pypdf).
+- **Parallel-then-converge:** `/start` enqueues transcribe + extract; whichever lands
+  second calls `maybe_enqueue_selection`, which fires selection exactly once (guarded
+  on status ∈ {transcribing, extracting}). NOTE: single-worker safe; the converge has
+  a theoretical double-enqueue race under concurrent workers — harden in Phase 5.
+- Selection persists the ClipList + ordered Segments and sets `AWAITING_REVIEW` — the
+  hard approval gate; render is never enqueued here (FR-19).
+- Status: `/start` sets the headline to `TRANSCRIBING` for the whole parallel phase;
+  `/status` derives per-stage states (transcription/extraction/selection/review/render)
+  from persisted artifacts (FR-24).

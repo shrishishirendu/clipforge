@@ -36,3 +36,22 @@ class MediaEngine(Protocol):
         """Cut the source at segment boundaries, concat, burn/sidecar captions.
         Return {output_uri, caption_uri, size_bytes}. Implementation: FFmpeg."""
         ...
+
+
+class LLMProvider(Protocol):
+    """The LLM behind a thin text-completion call (arch §1, §4 rule). The segment-
+    selection prompt + JSON validation + snapping live in services/segment_selection
+    (the IP); only the raw model call is swapped here. Default: Claude Sonnet."""
+
+    def complete(self, system: str, user: str, max_tokens: int = 4000) -> str:
+        """Return the model's text response for the given system + user prompt."""
+        ...
+
+
+class DocumentParser(Protocol):
+    """Extracts key points from a deck/summary file (FR-10, FR-11). Default impl
+    uses python-pptx / python-docx / pypdf; tests use a fake."""
+
+    def extract_key_points(self, path: str, asset_type: str, ext: str) -> list[dict]:
+        """Return [{"text": str, "source": str}] from the document at `path`."""
+        ...

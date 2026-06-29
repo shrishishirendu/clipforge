@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.models.entities import (
-    AssetStatus, AssetType, JobStatus, MediaAsset, Project, Transcript,
+    AssetStatus, AssetType, ClipList, JobStatus, KeyPoint, MediaAsset, Project,
+    Transcript,
 )
 from app.schemas.api import (
     AssetOut, AssetUploadRequest, AssetUploadResponse,
@@ -16,7 +17,7 @@ from app.schemas.api import (
 )
 from app.services.interfaces import ObjectStorage
 from app.services.storage import get_storage
-from app.workers.pipeline import transcribe_stage
+from app.workers.pipeline import extract_stage, transcribe_stage
 from app.workers.queue import get_queue
 
 router = APIRouter()
@@ -136,21 +137,28 @@ PIPELINE_STAGES = ["transcription", "extraction", "selection", "review", "render
 _STAGE_PCT = {"done": 100, "running": 50, "pending": 0, "failed": 0}
 
 
-def _build_stages(status: JobStatus, has_transcript: bool) -> list[dict]:
-    if has_transcript:
-        transcription = "done"
-    elif status == JobStatus.TRANSCRIBING:
-        transcription = "running"
-    elif status == JobStatus.FAILED:
-        transcription = "failed"
-    else:
-        transcription = "pending"
-    states = {"transcription": transcription}  # remaining stages: B5+
-    return [
-        {"name": s, "state": states.get(s, "pending"),
-         "pct": _STAGE_PCT[states.get(s, "pending")]}
-        for s in PIPELINE_STAGES
-    ]
+def _build_stages(status: JobStatus, has_transcript: bool,
+                  has_key_points: bool, has_clip_list: bool) -> list[dict]:
+    failed = status == JobStatus.FAILED
+    processing = status in (JobStatus.TRANSCRIBING, JobStatus.EXTRACTING)
+
+    def parallel_state(done: bool) -> str:
+        # transcription/extraction run together during the processing phase
+        return "done" if done else "failed" if failed else "running" if processing else "pending"
+
+    states = {
+        "transcription": parallel_state(has_transcript),
+        "extraction": parallel_state(has_key_points),
+        "selection": ("done" if has_clip_list else
+                      "running" if status == JobStatus.SELECTING else
+                      "failed" if failed else "pending"),
+        "review": ("done" if status in (JobStatus.RENDERING, JobStatus.COMPLETE) else
+                   "running" if status == JobStatus.AWAITING_REVIEW else "pending"),
+        "render": ("done" if status == JobStatus.COMPLETE else
+                   "running" if status == JobStatus.RENDERING else "pending"),
+    }
+    return [{"name": s, "state": states[s], "pct": _STAGE_PCT[states[s]]}
+            for s in PIPELINE_STAGES]
 
 
 @router.post("/projects/{project_id}/start", status_code=202)
@@ -172,7 +180,10 @@ def start_processing(project_id: str, db: Session = Depends(get_db),
 
     project.status = JobStatus.TRANSCRIBING
     db.commit()
+    # transcription and extraction run in parallel; whichever finishes second
+    # triggers selection (arch §6).
     queue.enqueue(transcribe_stage, project_id)
+    queue.enqueue(extract_stage, project_id)
     return {"project_id": project_id, "status": project.status.value}
 
 
@@ -184,8 +195,13 @@ def get_status(project_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "project not found")
     has_transcript = (
         db.query(Transcript).filter_by(project_id=project_id).first() is not None)
+    has_key_points = (
+        db.query(KeyPoint).filter_by(project_id=project_id).first() is not None)
+    has_clip_list = (
+        db.query(ClipList).filter_by(project_id=project_id).first() is not None)
     return StatusOut(project_id=project_id, status=project.status.value,
-                     stages=_build_stages(project.status, has_transcript))
+                     stages=_build_stages(project.status, has_transcript,
+                                          has_key_points, has_clip_list))
 
 
 @router.get("/projects/{project_id}/cliplist", response_model=ClipListOut)

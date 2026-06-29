@@ -69,6 +69,24 @@ def queue():
 
 
 @pytest.fixture
+def make_project(client, storage):
+    """Factory: create a project and complete READY uploads for the given types."""
+    names = {"video": "talk.mp4", "deck": "slides.pptx", "summary": "notes.docx"}
+
+    def _make(types=("video", "deck", "summary"), vocabulary=None):
+        pid = client.post("/api/projects",
+                          json={"title": "T", "vocabulary": vocabulary or []}).json()["id"]
+        for t in types:
+            up = client.post(f"/api/projects/{pid}/assets",
+                             json={"type": t, "filename": names[t]}).json()
+            storage.simulate_upload(up["storage_uri"], size_bytes=4096)
+            client.post(f"/api/projects/{pid}/assets/{up['asset_id']}/complete")
+        return pid
+
+    return _make
+
+
+@pytest.fixture
 def client(db_engine, storage, queue):
     TestingSession = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
 

@@ -64,14 +64,17 @@ def test_start_unknown_project_404(client):
     assert client.post("/api/projects/nope/start").status_code == 404
 
 
-def test_start_enqueues_transcription(client, storage, queue):
+def test_start_enqueues_transcription_and_extraction(client, storage, queue):
     pid = _project_with_all_assets(client, storage)
     r = client.post(f"/api/projects/{pid}/start")
     assert r.status_code == 202
     assert r.json()["status"] == "transcribing"
-    assert queue.count == 1
-    assert queue.jobs[0].func_name == "app.workers.pipeline.transcribe_stage"
-    assert queue.jobs[0].args == (pid,)
+    assert queue.count == 2  # transcribe + extract run in parallel (arch §6)
+    assert {j.func_name for j in queue.jobs} == {
+        "app.workers.pipeline.transcribe_stage",
+        "app.workers.pipeline.extract_stage",
+    }
+    assert all(j.args == (pid,) for j in queue.jobs)
 
 
 def test_start_twice_conflicts(client, storage):
@@ -94,7 +97,9 @@ def test_run_transcription_persists_transcript(client, storage, db_engine):
         assert t.full_text == CANNED["full_text"]
         assert t.word_timings == CANNED["word_timings"]
         assert t.silence_points == CANNED["silence_points"]
-        assert s.get(Project, pid).status == JobStatus.EXTRACTING
+        # B5: transcription alone leaves the job TRANSCRIBING; convergence (once
+        # extraction also lands) advances it to SELECTING.
+        assert s.get(Project, pid).status == JobStatus.TRANSCRIBING
 
     # custom vocabulary was passed through to the provider (FR-08)
     assert provider.calls[0][1] == ["Acme", "Kubernetes"]
@@ -140,7 +145,7 @@ def test_status_progresses_pending_then_done(client, storage, db_engine):
         run_transcription(s, storage, FakeProvider(), pid)
 
     body = client.get(f"/api/projects/{pid}/status").json()
-    assert body["status"] == "extracting"
+    assert body["status"] == "transcribing"  # extraction hasn't landed yet
     stages = {s["name"]: s for s in body["stages"]}
     assert stages["transcription"]["state"] == "done"
     assert stages["transcription"]["pct"] == 100
