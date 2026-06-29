@@ -84,3 +84,20 @@ pending back-fill into requirements v0.2:
   remaining time budget; new segments overlapping a locked range are dropped.
 - `rebuild_clip_list` is the single writer for clip lists (selection, re-edit),
   recomputing coverage/total and preserving each segment's `locked` flag.
+
+## B7 — Approval gate, render, output (FR-19, FR-20, FR-21, FR-23, NFR-07)
+- **The gate (FR-19):** `POST /approve` is the ONLY place `render_stage` is enqueued.
+  It requires status AWAITING_REVIEW + ≥1 segment, and `run_render` independently
+  refuses to run unless the clip list is APPROVED (defence in depth).
+- **Approve-with-gaps:** if any key point is uncovered, `/approve` returns 409 with
+  the uncovered ids; the client re-POSTs `{confirm_gaps: true}` to proceed.
+- **Render:** FFmpeg behind `MediaEngine` (single `filter_complex` pass: trim each
+  segment, scale to the target height, concat). Re-encode (not stream-copy) so cuts
+  land exactly on the silence-snapped boundaries, not keyframes (FR-20). The engine
+  works on local files; `run_render` handles MinIO download/upload.
+- **Captions:** sidecar `.srt` (OQ-03), built in Python from the segments on the
+  *output* timeline (`services/captions.build_srt`); reviewable/correctable (NFR-03).
+- **Output:** `GET /output` returns presigned GET links for the MP4 + SRT plus
+  metadata (resolution, size). Default resolution 1080p (`settings.output_resolution`).
+- Env: FFmpeg is required for render (installed via winget; `settings.ffmpeg_bin`
+  defaults to PATH, override with `FFMPEG_BIN` on dev boxes where it isn't on PATH).

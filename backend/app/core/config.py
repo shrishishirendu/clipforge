@@ -38,5 +38,10 @@ class Settings(BaseSettings):
     default_target_max_sec: int = 240  # 4 min
     nudge_step_sec: float = 0.5        # boundary nudge granularity (FR-15)
 
+    # Render (FFmpeg). ffmpeg_bin defaults to PATH; override via env on dev boxes
+    # where it isn't on PATH yet (FFMPEG_BIN=...). Captions are sidecar SRT (OQ-03).
+    ffmpeg_bin: str = "ffmpeg"
+    output_resolution: str = "1080p"
+
 
 settings = Settings()

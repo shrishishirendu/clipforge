@@ -24,16 +24,19 @@ import tempfile
 from rq import Queue
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models.entities import (
     ApprovalStatus, AssetStatus, AssetType, ClipList, JobStatus, KeyPoint,
-    MediaAsset, Project, Segment, Transcript,
+    MediaAsset, Project, RenderJob, Segment, Transcript,
 )
+from app.services.captions import build_srt
 from app.services.extraction import get_document_parser
 from app.services.interfaces import (
-    DocumentParser, LLMProvider, ObjectStorage, TranscriptionProvider,
+    DocumentParser, LLMProvider, MediaEngine, ObjectStorage, TranscriptionProvider,
 )
 from app.services.llm import get_llm_provider
+from app.services.media import get_media_engine
 from app.services.segment_selection import select_segments
 from app.services.storage import get_storage
 from app.services.transcription import get_transcription_provider
@@ -282,9 +285,82 @@ def run_reedit(db: Session, llm: LLMProvider, project_id: str) -> Project:
 # === Render (B7) ============================================================
 
 def render_stage(project_id: str) -> None:
-    """Approved ClipList → MP4 + captions (FR-20, FR-21, FR-23). Calls the
-    MediaEngine (FFmpeg). Only ever enqueued by /approve. Persist RenderJob."""
-    raise NotImplementedError("BUILD_PLAN.md task B7")
+    db = SessionLocal()
+    try:
+        run_render(db, get_storage(), get_media_engine(), project_id)
+    finally:
+        db.close()
+
+
+def run_render(db: Session, storage: ObjectStorage, engine: MediaEngine,
+               project_id: str) -> RenderJob:
+    """Approved ClipList → MP4 + sidecar SRT (FR-20, FR-21, FR-23). Safety net: it
+    refuses to run unless the clip list is APPROVED — render is only reachable via
+    /approve (FR-19)."""
+    project = db.get(Project, project_id)
+    if project is None:
+        raise ValueError(f"project {project_id} not found")
+    clip = db.query(ClipList).filter_by(project_id=project_id).one_or_none()
+    if clip is None or clip.approval_status != ApprovalStatus.APPROVED:
+        raise ValueError("render requires an APPROVED clip list (the gate, FR-19)")
+    segments = sorted(clip.segments, key=lambda s: s.order)
+    if not segments:
+        raise ValueError("approved clip list has no segments to render")
+    video = next((a for a in project.assets
+                  if a.type == AssetType.VIDEO and a.status == AssetStatus.READY), None)
+    if video is None:
+        raise ValueError("no READY source video to render from")
+
+    project.status = JobStatus.RENDERING
+    db.commit()
+    seg_dicts = [{"start_sec": s.start_sec, "end_sec": s.end_sec,
+                  "transcript": s.transcript_snippet} for s in segments]
+    tmp_dir = tempfile.mkdtemp(prefix="clipforge-render-")
+    src_path = os.path.join(tmp_dir, "source" + (os.path.splitext(video.storage_uri)[1] or ".mp4"))
+    out_mp4 = os.path.join(tmp_dir, "cut.mp4")
+    out_srt = os.path.join(tmp_dir, "cut.srt")
+    try:
+        storage.download_to_path(video.storage_uri, src_path)
+        info = engine.render(src_path, seg_dicts, out_mp4, resolution=settings.output_resolution)
+        with open(out_srt, "w", encoding="utf-8") as fh:
+            fh.write(build_srt(seg_dicts))
+
+        mp4_key = f"projects/{project_id}/output/cut.mp4"
+        srt_key = f"projects/{project_id}/output/cut.srt"
+        storage.upload_file(out_mp4, mp4_key, "video/mp4")
+        storage.upload_file(out_srt, srt_key, "application/x-subrip")
+
+        render_job = _persist_render_job(db, project_id, mp4_key, srt_key,
+                                         info["size_bytes"], settings.output_resolution)
+        project.status = JobStatus.COMPLETE
+        db.commit()
+        return render_job
+    except Exception:
+        _mark_failed(db, project_id)
+        raise
+    finally:
+        for p in (src_path, out_mp4, out_srt):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
+def _persist_render_job(db: Session, project_id: str, output_key: str,
+                        caption_key: str, size_bytes: int, resolution: str) -> RenderJob:
+    existing = db.query(RenderJob).filter_by(project_id=project_id).one_or_none()
+    if existing is not None:
+        db.delete(existing)
+        db.flush()
+    job = RenderJob(project_id=project_id, status="complete", output_uri=output_key,
+                    caption_uri=caption_key, resolution=resolution, size_bytes=size_bytes)
+    db.add(job)
+    db.flush()
+    return job
 
 
 # === Shared helpers =========================================================

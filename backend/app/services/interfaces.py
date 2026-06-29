@@ -22,6 +22,14 @@ class ObjectStorage(Protocol):
         """Download the object to a local path (workers pull media to process it)."""
         ...
 
+    def upload_file(self, local_path: str, key: str, content_type: str | None = None) -> None:
+        """Upload a local file (render outputs: MP4, SRT) to storage."""
+        ...
+
+    def presigned_get_url(self, key: str, expires_in: int = 3600) -> str:
+        """A time-limited download URL for an object (the output MP4/captions)."""
+        ...
+
 
 class TranscriptionProvider(Protocol):
     def transcribe(self, audio_uri: str, vocabulary: list[str]) -> dict:
@@ -31,10 +39,14 @@ class TranscriptionProvider(Protocol):
 
 
 class MediaEngine(Protocol):
-    def cut_and_concat(self, source_uri: str, segments: list[dict],
-                       captions: list[dict] | None, resolution: str) -> dict:
-        """Cut the source at segment boundaries, concat, burn/sidecar captions.
-        Return {output_uri, caption_uri, size_bytes}. Implementation: FFmpeg."""
+    """Video processing behind FFmpeg. Works on local files; the worker handles
+    storage download/upload (keeps FFmpeg decoupled from object storage)."""
+
+    def render(self, source_path: str, segments: list[dict], output_path: str,
+               resolution: str = "1080p") -> dict:
+        """Cut source_path at each segment's [start_sec, end_sec], concat in order
+        into output_path (MP4). Return {"size_bytes": int}. (Sidecar captions are
+        built separately, services/captions.py.)"""
         ...
 
 

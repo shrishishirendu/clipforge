@@ -1,6 +1,8 @@
 """Test fixtures. Endpoint tests run against an in-memory SQLite DB and a fake
 object store, so the suite is hermetic — no Postgres or MinIO required, keeping
 `pytest` green anywhere (working agreement)."""
+import os
+
 import fakeredis
 import pytest
 from fastapi.testclient import TestClient
@@ -34,9 +36,15 @@ class FakeStorage:
     def download_to_path(self, key: str, dest_path: str) -> None:
         if key not in self.objects:
             raise FileNotFoundError(key)
-        # content is irrelevant — the fake transcription provider ignores the file
+        # content is irrelevant — fake providers/engine ignore the file
         with open(dest_path, "wb") as fh:
             fh.write(b"fake-media-bytes")
+
+    def upload_file(self, local_path: str, key: str, content_type: str | None = None) -> None:
+        self.objects[key] = os.path.getsize(local_path)
+
+    def presigned_get_url(self, key: str, expires_in: int = 3600) -> str:
+        return f"https://fake-storage.local/get/{key}?sig=test&ttl={expires_in}"
 
     # --- test helper, not part of the ObjectStorage interface ---
     def simulate_upload(self, key: str, size_bytes: int = 1024):

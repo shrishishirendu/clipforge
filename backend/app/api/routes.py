@@ -9,16 +9,19 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.models.entities import (
     ApprovalStatus, AssetStatus, AssetType, ClipList, JobStatus, KeyPoint,
-    MediaAsset, Project, Transcript,
+    MediaAsset, Project, RenderJob, Transcript,
 )
 from app.schemas.api import (
-    AssetOut, AssetUploadRequest, AssetUploadResponse,
-    ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, SegmentOut, StatusOut,
+    ApproveRequest, AssetOut, AssetUploadRequest, AssetUploadResponse,
+    ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, OutputOut, SegmentOut,
+    StatusOut,
 )
 from app.services.interfaces import ObjectStorage
 from app.services.segment_selection import snap_to_silence
 from app.services.storage import get_storage
-from app.workers.pipeline import extract_stage, reedit_stage, transcribe_stage
+from app.workers.pipeline import (
+    extract_stage, reedit_stage, render_stage, transcribe_stage,
+)
 from app.workers.queue import get_queue
 
 router = APIRouter()
@@ -298,14 +301,49 @@ def reedit(project_id: str, db: Session = Depends(get_db),
     return {"project_id": project_id, "status": project.status.value}
 
 
-@router.post("/projects/{project_id}/approve")
-def approve(project_id: str):
-    """Approve the cut and enqueue render (FR-19). The hard gate: render is
-    only enqueued here."""
-    raise HTTPException(501, "not implemented — task B7")
+@router.post("/projects/{project_id}/approve", status_code=202)
+def approve(project_id: str, body: ApproveRequest | None = None,
+            db: Session = Depends(get_db), queue: Queue = Depends(get_queue)):
+    """The approval gate (FR-19): the ONLY place render is enqueued. Requires the
+    job to be AWAITING_REVIEW with at least one segment. If key points are uncovered,
+    requires confirm_gaps=true (approve-with-gaps confirmation)."""
+    project, clip = _require_clip(db, project_id)
+    if clip.approval_status == ApprovalStatus.APPROVED:
+        raise HTTPException(409, "clip list already approved")
+    if project.status != JobStatus.AWAITING_REVIEW:
+        raise HTTPException(409, f"not awaiting review (status: {project.status.value})")
+    if not clip.segments:
+        raise HTTPException(422, "clip list has no segments to render")
+
+    key_points = db.query(KeyPoint).filter_by(project_id=project_id).all()
+    covered = {s.key_point_id for s in clip.segments if s.key_point_id}
+    uncovered = [kp.id for kp in key_points if kp.id not in covered]
+    if uncovered and not (body and body.confirm_gaps):
+        raise HTTPException(409, detail={
+            "error": "uncovered_key_points",
+            "message": "some key points are uncovered; re-POST with confirm_gaps=true",
+            "uncovered_key_point_ids": uncovered,
+        })
+
+    clip.approval_status = ApprovalStatus.APPROVED
+    project.status = JobStatus.RENDERING
+    db.commit()
+    queue.enqueue(render_stage, project_id)  # the only enqueue of render (FR-19)
+    return {"project_id": project_id, "status": project.status.value}
 
 
-@router.get("/projects/{project_id}/output")
-def get_output(project_id: str):
-    """Render result: MP4, captions, metadata (FR-23)."""
-    raise HTTPException(501, "not implemented — task B7")
+@router.get("/projects/{project_id}/output", response_model=OutputOut)
+def get_output(project_id: str, db: Session = Depends(get_db),
+               storage: ObjectStorage = Depends(get_storage)):
+    """Render result: MP4 + captions download links, metadata (FR-23)."""
+    if db.get(Project, project_id) is None:
+        raise HTTPException(404, "project not found")
+    job = db.query(RenderJob).filter_by(project_id=project_id).one_or_none()
+    if job is None:
+        raise HTTPException(404, "no render output yet")
+    return OutputOut(
+        project_id=project_id, status=job.status, resolution=job.resolution,
+        size_bytes=job.size_bytes,
+        video_url=storage.presigned_get_url(job.output_uri) if job.output_uri else None,
+        captions_url=storage.presigned_get_url(job.caption_uri) if job.caption_uri else None,
+    )

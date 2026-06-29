@@ -4,32 +4,11 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.models.entities import ApprovalStatus, ClipList, JobStatus, KeyPoint, Project
-from app.workers.pipeline import (
-    run_extraction, run_reedit, run_selection, run_transcription,
-)
-from tests._doubles import FakeDocumentParser, FakeLLM, FakeTranscriptionProvider
+from app.models.entities import ApprovalStatus, ClipList, JobStatus, Project
+from app.workers.pipeline import run_reedit
+from tests._doubles import FakeLLM, drive_to_review as _drive_to_review
 
 # CANNED_TRANSCRIPT silence points are [0.0, 1.45, 2.4].
-
-
-def _drive_to_review(storage, db_engine, pid):
-    """Run transcription + extraction + selection so the project has a clip list
-    with two segments (one per key point) at AWAITING_REVIEW."""
-    with Session(db_engine) as s:
-        run_transcription(s, storage, FakeTranscriptionProvider(), pid)
-        run_extraction(s, storage, FakeDocumentParser(), pid)
-    with Session(db_engine) as s:
-        kps = {k.source: k.id for k in s.query(KeyPoint).filter_by(project_id=pid)}
-    resp = json.dumps({"segments": [
-        {"start_sec": 0.0, "end_sec": 1.45, "transcript": "hello world",
-         "key_point_id": kps["deck"], "confidence": 0.9},
-        {"start_sec": 1.45, "end_sec": 2.4, "transcript": "talk",
-         "key_point_id": kps["summary"], "confidence": 0.8}],
-        "total_duration_sec": 2.4, "uncovered_key_point_ids": []})
-    with Session(db_engine) as s:
-        run_selection(s, FakeLLM([resp]), pid)
-    return kps
 
 
 def test_get_cliplist_serves_segments_and_full_coverage(client, storage, db_engine, make_project):

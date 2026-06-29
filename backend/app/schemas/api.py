@@ -80,3 +80,19 @@ class StatusOut(BaseModel):
     project_id: str
     status: str
     stages: list[dict]  # [{name, state, pct, duration_sec}]
+
+
+class ApproveRequest(BaseModel):
+    """Approve the cut (FR-19). confirm_gaps acknowledges uncovered key points
+    (approve-with-gaps confirmation, design back-fill)."""
+    confirm_gaps: bool = False
+
+
+class OutputOut(BaseModel):
+    """Render result with time-limited download links (FR-23)."""
+    project_id: str
+    status: str               # render job status, e.g. "complete"
+    resolution: str
+    size_bytes: int
+    video_url: str | None      # presigned GET for the MP4
+    captions_url: str | None   # presigned GET for the sidecar SRT

@@ -37,6 +37,17 @@ class S3Storage:
             ExpiresIn=expires_in,
         )
 
+    def presigned_get_url(self, key: str, expires_in: int = 3600) -> str:
+        return self._client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self._bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+
+    def upload_file(self, local_path: str, key: str, content_type: str | None = None) -> None:
+        extra = {"ContentType": content_type} if content_type else None
+        self._client.upload_file(local_path, self._bucket, key, ExtraArgs=extra)
+
     def stat(self, key: str) -> dict | None:
         try:
             head = self._client.head_object(Bucket=self._bucket, Key=key)
