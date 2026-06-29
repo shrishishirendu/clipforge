@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from rq import Queue
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.models.entities import (
     ApprovalStatus, AssetStatus, AssetType, ClipList, JobStatus, KeyPoint,
@@ -13,8 +14,8 @@ from app.models.entities import (
 )
 from app.schemas.api import (
     ApproveRequest, AssetOut, AssetUploadRequest, AssetUploadResponse,
-    ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, OutputOut, SegmentOut,
-    StatusOut,
+    ProjectCreate, ProjectOut, ClipListOut, ClipListPatch, KeyPointOut, OutputOut,
+    SegmentOut, StatusOut,
 )
 from app.services.interfaces import ObjectStorage
 from app.services.segment_selection import snap_to_silence
@@ -185,9 +186,9 @@ def start_processing(project_id: str, db: Session = Depends(get_db),
     project.status = JobStatus.TRANSCRIBING
     db.commit()
     # transcription and extraction run in parallel; whichever finishes second
-    # triggers selection (arch §6).
-    queue.enqueue(transcribe_stage, project_id)
-    queue.enqueue(extract_stage, project_id)
+    # triggers selection (arch §6). Generous timeout — CPU transcription is slow.
+    queue.enqueue(transcribe_stage, project_id, job_timeout=settings.job_timeout_sec)
+    queue.enqueue(extract_stage, project_id, job_timeout=settings.job_timeout_sec)
     return {"project_id": project_id, "status": project.status.value}
 
 
@@ -218,7 +219,8 @@ def _require_clip(db: Session, project_id: str):
     return project, clip
 
 
-def _clip_list_out(clip: ClipList, key_points: list[KeyPoint]) -> ClipListOut:
+def _clip_list_out(project: Project, clip: ClipList,
+                   key_points: list[KeyPoint]) -> ClipListOut:
     """Shape the response, recomputing coverage + total from the live segments."""
     segs = sorted(clip.segments, key=lambda s: s.order)
     covered = {s.key_point_id for s in segs if s.key_point_id}
@@ -226,8 +228,11 @@ def _clip_list_out(clip: ClipList, key_points: list[KeyPoint]) -> ClipListOut:
     total = int(round(sum(s.end_sec - s.start_sec for s in segs)))
     return ClipListOut(
         id=clip.id, total_duration_sec=total,
+        target_min_sec=project.target_min_sec, target_max_sec=project.target_max_sec,
         approval_status=clip.approval_status.value,
         uncovered_key_point_ids=uncovered,
+        key_points=[KeyPointOut(id=kp.id, text=kp.text, source=kp.source)
+                    for kp in key_points],
         segments=[SegmentOut(id=s.id, order=s.order, start_sec=s.start_sec,
                              end_sec=s.end_sec, transcript_snippet=s.transcript_snippet,
                              confidence=s.confidence, key_point_id=s.key_point_id,
@@ -237,16 +242,16 @@ def _clip_list_out(clip: ClipList, key_points: list[KeyPoint]) -> ClipListOut:
 @router.get("/projects/{project_id}/cliplist", response_model=ClipListOut)
 def get_cliplist(project_id: str, db: Session = Depends(get_db)):
     """The proposed clip list for review (FR-16)."""
-    _, clip = _require_clip(db, project_id)
+    project, clip = _require_clip(db, project_id)
     key_points = db.query(KeyPoint).filter_by(project_id=project_id).all()
-    return _clip_list_out(clip, key_points)
+    return _clip_list_out(project, clip, key_points)
 
 
 @router.patch("/projects/{project_id}/cliplist", response_model=ClipListOut)
 def patch_cliplist(project_id: str, body: ClipListPatch, db: Session = Depends(get_db)):
     """Apply reorder / remove / nudge / lock edits (FR-17, FR-18). Boundary nudges
     snap to silence (FR-15); coverage + total are recomputed."""
-    _, clip = _require_clip(db, project_id)
+    project, clip = _require_clip(db, project_id)
     if clip.approval_status == ApprovalStatus.APPROVED:
         raise HTTPException(409, "clip list already approved; cannot edit")
 
@@ -284,7 +289,7 @@ def patch_cliplist(project_id: str, body: ClipListPatch, db: Session = Depends(g
     clip.total_duration_sec = int(round(sum(s.end_sec - s.start_sec for s in segs.values())))
     db.commit()
     db.refresh(clip)
-    return _clip_list_out(clip, key_points)
+    return _clip_list_out(project, clip, key_points)
 
 
 @router.post("/projects/{project_id}/reedit", status_code=202)
@@ -297,7 +302,7 @@ def reedit(project_id: str, db: Session = Depends(get_db),
         raise HTTPException(409, "clip list already approved; cannot re-edit")
     project.status = JobStatus.SELECTING
     db.commit()
-    queue.enqueue(reedit_stage, project_id)
+    queue.enqueue(reedit_stage, project_id, job_timeout=settings.job_timeout_sec)
     return {"project_id": project_id, "status": project.status.value}
 
 
@@ -328,7 +333,8 @@ def approve(project_id: str, body: ApproveRequest | None = None,
     clip.approval_status = ApprovalStatus.APPROVED
     project.status = JobStatus.RENDERING
     db.commit()
-    queue.enqueue(render_stage, project_id)  # the only enqueue of render (FR-19)
+    # the only enqueue of render (FR-19); generous timeout — FFmpeg can run minutes
+    queue.enqueue(render_stage, project_id, job_timeout=settings.job_timeout_sec)
     return {"project_id": project_id, "status": project.status.value}
 
 

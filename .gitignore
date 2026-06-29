@@ -1,11 +1,15 @@
 __pycache__/
 *.pyc
 .env
+.env.local
 .venv/
 node_modules/
 .next/
+next-env.d.ts
+*.tsbuildinfo
 dist/
 *.mp4
 *.docx
 media/
+samples/
 .DS_Store

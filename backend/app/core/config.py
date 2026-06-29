@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     # Core
     app_name: str = "ClipForge"
     environment: str = "development"
+    cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    # Heavy stages (CPU Whisper transcription, FFmpeg render) can run for many
+    # minutes — well past RQ's 180s default. Generous ceiling so they don't time
+    # out (NFR-01); tune per deployment / GPU.
+    job_timeout_sec: int = 7200  # 2 hours
 
     # Data layer
     database_url: str = "postgresql+psycopg://clipforge:clipforge@localhost:5432/clipforge"

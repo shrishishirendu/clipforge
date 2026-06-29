@@ -54,11 +54,20 @@ class SegmentOut(BaseModel):
     locked: bool
 
 
+class KeyPointOut(BaseModel):
+    id: str
+    text: str
+    source: str
+
+
 class ClipListOut(BaseModel):
     id: str
     total_duration_sec: int
+    target_min_sec: int
+    target_max_sec: int
     approval_status: str
     uncovered_key_point_ids: list[str]
+    key_points: list[KeyPointOut]      # for the coverage panel (FR-16)
     segments: list[SegmentOut]
 
 

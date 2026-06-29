@@ -151,7 +151,7 @@ def maybe_enqueue_selection(db: Session, queue: Queue, project_id: str) -> bool:
         return False
     project.status = JobStatus.SELECTING
     db.commit()
-    queue.enqueue(select_segments_stage, project_id)
+    queue.enqueue(select_segments_stage, project_id, job_timeout=settings.job_timeout_sec)
     return True
 
 
